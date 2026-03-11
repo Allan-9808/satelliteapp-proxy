@@ -37,18 +37,17 @@ async function getUsgsApiKey() {
   try {
     data = JSON.parse(text);
   } catch (e) {
-    throw new Error('USGS returned non-JSON response: ' + text.substring(0, 200));
+    throw new Error('USGS returned non-JSON: ' + text.substring(0, 200));
   }
   if (data.errorCode) {
     throw new Error(data.errorCode + ': ' + data.errorMessage);
   }
   usgsApiKey = data.data;
-  usgsApiKeyExpiry = now + (90 * 60 * 1000); // 90 minutes
+  usgsApiKeyExpiry = now + (90 * 60 * 1000);
   console.log('[USGS] Got new API key successfully');
   return usgsApiKey;
 }
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -59,31 +58,26 @@ app.get('/', (req, res) => {
   });
 });
 
-// App login
-app.post('/auth/login', async (req, res) => {
+// App login - ONLY checks username/password, does NOT call USGS
+app.post('/auth/login', (req, res) => {
   const { username, password } = req.body;
   console.log(`[LOGIN] ${username} is logging in...`);
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password required' });
   }
-  if (username !== APP_USERNAME || password !== APP_PASSWORD) {
+
+  const usernameMatch = username.trim() === APP_USERNAME.trim();
+  const passwordMatch = password.trim() === APP_PASSWORD.trim();
+
+  if (!usernameMatch || !passwordMatch) {
+    console.log(`[LOGIN] Failed for ${username}`);
     return res.status(401).json({ error: 'Invalid username or password' });
   }
 
-  try {
-    const apiKey = await getUsgsApiKey();
-    const token = jwt.sign(
-      { username, usgsApiKey: apiKey },
-      JWT_SECRET,
-      { expiresIn: '8h' }
-    );
-    console.log(`[LOGIN] ✅ ${username} authenticated successfully`);
-    res.json({ token, username });
-  } catch (err) {
-    console.error('[LOGIN] USGS login failed:', err.message);
-    res.status(500).json({ error: 'USGS authentication failed: ' + err.message });
-  }
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '8h' });
+  console.log(`[LOGIN] ✅ ${username} authenticated successfully`);
+  res.json({ token, username });
 });
 
 // Forward USGS requests
@@ -104,9 +98,7 @@ app.post('/usgs/:endpoint', async (req, res) => {
   console.log(`[USGS] ${decoded.username} → ${endpoint}`);
 
   try {
-    // Always get a fresh valid USGS key
     const apiKey = await getUsgsApiKey();
-
     const response = await fetch(`${USGS_API}/${endpoint}`, {
       method: 'POST',
       headers: {
@@ -121,30 +113,21 @@ app.post('/usgs/:endpoint', async (req, res) => {
     try {
       data = JSON.parse(text);
     } catch (e) {
-      console.error(`[USGS] Non-JSON response for ${endpoint}:`, text.substring(0, 200));
       return res.status(500).json({ error: 'USGS returned invalid response' });
     }
 
-    if (data.errorCode) {
-      console.error(`[USGS] ${endpoint} → errorCode: ${data.errorCode}`);
-      // If unauthorized, reset cached key and retry once
-      if (data.errorCode === 'UNAUTHORIZED_USER' || data.errorCode === 'AUTH_INVALID') {
-        console.log('[USGS] Resetting API key and retrying...');
-        usgsApiKey = null;
-        usgsApiKeyExpiry = null;
-        const newKey = await getUsgsApiKey();
-        const retry = await fetch(`${USGS_API}/${endpoint}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Auth-Token': newKey
-          },
-          body: JSON.stringify(req.body)
-        });
-        const retryData = await retry.json();
-        console.log(`[USGS] ${endpoint} retry → status ${retry.status}`);
-        return res.status(retry.status).json(retryData);
-      }
+    if (data.errorCode === 'UNAUTHORIZED_USER' || data.errorCode === 'AUTH_INVALID') {
+      console.log('[USGS] Auth expired, refreshing and retrying...');
+      usgsApiKey = null;
+      usgsApiKeyExpiry = null;
+      const newKey = await getUsgsApiKey();
+      const retry = await fetch(`${USGS_API}/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Auth-Token': newKey },
+        body: JSON.stringify(req.body)
+      });
+      const retryData = await retry.json();
+      return res.status(retry.status).json(retryData);
     }
 
     console.log(`[USGS] ${endpoint} → status ${response.status}`);
