@@ -1,194 +1,164 @@
-// ============================================================
-// SatelliteApp Proxy Server v2.0
-// Deployed on Render.com (FREE tier)
-// ------------------------------------------------------------
-// HOW IT WORKS:
-// 1. Your mobile app sends username + password to /auth/login
-// 2. This server checks them against your env vars
-// 3. If correct, it logs into USGS using YOUR stored token
-// 4. Returns a session key to the app
-// 5. App uses session key for all USGS searches
-// ------------------------------------------------------------
-// ENVIRONMENT VARIABLES to set on Render:
-//   USGS_USERNAME   = your USGS username e.g. Allan_Tester
-//   USGS_TOKEN      = your 64-char USGS Application Token
-//   APP_USERNAME    = username you want to use in the app
-//   APP_PASSWORD    = password you want to use in the app
-//   JWT_SECRET      = any long random string e.g. MySecret2026XYZ
-// ============================================================
-
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
-// Read credentials from Render environment variables
+const PORT = process.env.PORT || 10000;
+const USGS_API = 'https://m2m.cr.usgs.gov/api/api/json/stable';
+
 const USGS_USERNAME = process.env.USGS_USERNAME;
-const USGS_TOKEN    = process.env.USGS_TOKEN;
-const APP_USERNAME  = process.env.APP_USERNAME;
-const APP_PASSWORD  = process.env.APP_PASSWORD;
-const JWT_SECRET    = process.env.JWT_SECRET || 'changeme_please';
-const USGS_BASE     = 'https://m2m.cr.usgs.gov/api/api/json/stable';
+const USGS_TOKEN = process.env.USGS_TOKEN;
+const APP_USERNAME = process.env.APP_USERNAME;
+const APP_PASSWORD = process.env.APP_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET || 'SatelliteApp2026SecretKey';
 
-// ── Health check (visit this URL to confirm server is running) ──
+let usgsApiKey = null;
+let usgsApiKeyExpiry = null;
+
+async function getUsgsApiKey() {
+  const now = Date.now();
+  if (usgsApiKey && usgsApiKeyExpiry && now < usgsApiKeyExpiry) {
+    return usgsApiKey;
+  }
+  console.log('[USGS] Logging into USGS with token...');
+  const response = await fetch(`${USGS_API}/login-token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: USGS_USERNAME,
+      token: USGS_TOKEN
+    })
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error('USGS returned non-JSON response: ' + text.substring(0, 200));
+  }
+  if (data.errorCode) {
+    throw new Error(data.errorCode + ': ' + data.errorMessage);
+  }
+  usgsApiKey = data.data;
+  usgsApiKeyExpiry = now + (90 * 60 * 1000); // 90 minutes
+  console.log('[USGS] Got new API key successfully');
+  return usgsApiKey;
+}
+
+// Health check
 app.get('/', (req, res) => {
-  const configured = !!(USGS_USERNAME && USGS_TOKEN && APP_USERNAME && APP_PASSWORD);
   res.json({
-    status: '✅ SatelliteApp Proxy v2.0 Running',
-    configured,
-    hint: configured
-      ? 'All environment variables are set ✅'
-      : '⚠️ Missing env vars — set USGS_USERNAME, USGS_TOKEN, APP_USERNAME, APP_PASSWORD, JWT_SECRET on Render',
+    status: 'ok',
+    service: 'SatelliteApp Proxy',
+    usgsUser: USGS_USERNAME ? 'configured' : 'MISSING',
+    usgsToken: USGS_TOKEN ? 'configured' : 'MISSING',
+    appCredentials: APP_USERNAME ? 'configured' : 'MISSING'
   });
 });
 
-// ── App Login ──────────────────────────────────────────────────
-// Called by the mobile app when user enters username + password
+// App login
 app.post('/auth/login', async (req, res) => {
-  const { username, password } = req.body || {};
-
-  // Check server is configured
-  if (!USGS_USERNAME || !USGS_TOKEN || !APP_USERNAME || !APP_PASSWORD) {
-    return res.status(500).json({
-      success: false,
-      error: 'Server not configured. Please set environment variables on Render.',
-    });
-  }
-
-  // Check app credentials
-  if (!username || !password) {
-    return res.status(400).json({ success: false, error: 'Username and password are required.' });
-  }
-  if (username !== APP_USERNAME || password !== APP_PASSWORD) {
-    return res.status(401).json({ success: false, error: 'Incorrect username or password.' });
-  }
-
+  const { username, password } = req.body;
   console.log(`[LOGIN] ${username} is logging in...`);
 
-  // Login to USGS using stored token
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  if (username !== APP_USERNAME || password !== APP_PASSWORD) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+
   try {
-    const usgsRes = await fetch(`${USGS_BASE}/login-token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 SatelliteApp/2.0',
-      },
-      body: JSON.stringify({
-        username: USGS_USERNAME,
-        token: USGS_TOKEN,
-      }),
-    });
-
-    const text = await usgsRes.text();
-    let usgsData;
-    try {
-      usgsData = JSON.parse(text);
-    } catch (e) {
-      console.error('[LOGIN] USGS returned non-JSON:', text.substring(0, 200));
-      return res.status(502).json({
-        success: false,
-        error: 'USGS server returned unexpected response. Check your USGS_TOKEN is correct.',
-      });
-    }
-
-    if (usgsData.errorCode || !usgsData.data) {
-      console.error('[LOGIN] USGS error:', usgsData.errorCode, usgsData.errorMessage);
-      return res.status(401).json({
-        success: false,
-        error: `USGS Error: ${usgsData.errorCode} — ${usgsData.errorMessage}.\n\nCheck your USGS_TOKEN on Render.`,
-      });
-    }
-
-    console.log(`[LOGIN] ✅ ${username} authenticated successfully`);
-
-    // Create a session JWT containing the USGS API key
-    const sessionToken = jwt.sign(
-      { username, usgsApiKey: usgsData.data },
+    const apiKey = await getUsgsApiKey();
+    const token = jwt.sign(
+      { username, usgsApiKey: apiKey },
       JWT_SECRET,
-      { expiresIn: '8h' } // session lasts 8 hours
+      { expiresIn: '8h' }
     );
-
-    res.json({ success: true, token: sessionToken, username });
-
+    console.log(`[LOGIN] ✅ ${username} authenticated successfully`);
+    res.json({ token, username });
   } catch (err) {
-    console.error('[LOGIN] Network error:', err.message);
-    res.status(500).json({
-      success: false,
-      error: 'Cannot reach USGS servers: ' + err.message,
-    });
+    console.error('[LOGIN] USGS login failed:', err.message);
+    res.status(500).json({ error: 'USGS authentication failed: ' + err.message });
   }
 });
 
-// ── Verify Session Token Middleware ───────────────────────────
-const verifyToken = (req, res, next) => {
-  const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Bearer ')) {
-    return res.status(401).json({ errorCode: 'NOT_LOGGED_IN', errorMessage: 'Please log in first.' });
+// Forward USGS requests
+app.post('/usgs/:endpoint', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
   }
+
+  let decoded;
   try {
-    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
-    next();
+    decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
   } catch (err) {
-    return res.status(401).json({
-      errorCode: 'SESSION_EXPIRED',
-      errorMessage: 'Your session has expired. Please log in again.',
-    });
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
-};
 
-// ── Proxy USGS Endpoints ───────────────────────────────────────
-// Forwards any USGS API call from the app through to USGS
-app.post('/usgs/:endpoint', verifyToken, async (req, res) => {
   const endpoint = req.params.endpoint;
-
-  // Inject the USGS API key from the session
-  const body = { ...req.body, apiKey: req.user.usgsApiKey };
-
-  console.log(`[USGS] ${req.user.username} → ${endpoint}`);
+  console.log(`[USGS] ${decoded.username} → ${endpoint}`);
 
   try {
-    const response = await fetch(`${USGS_BASE}/${endpoint}`, {
+    // Always get a fresh valid USGS key
+    const apiKey = await getUsgsApiKey();
+
+    const response = await fetch(`${USGS_API}/${endpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 SatelliteApp/2.0',
+        'X-Auth-Token': apiKey
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(req.body)
     });
 
     const text = await response.text();
-
+    let data;
     try {
-      const data = JSON.parse(text);
-      console.log(`[USGS] ${endpoint} → status ${response.status}, errorCode: ${data.errorCode || 'none'}`);
-      res.json(data);
+      data = JSON.parse(text);
     } catch (e) {
-      console.error(`[USGS] ${endpoint} returned non-JSON:`, text.substring(0, 300));
-      res.status(502).json({
-        errorCode: 'PARSE_ERROR',
-        errorMessage: 'USGS returned an unexpected response. Try again later.',
-      });
+      console.error(`[USGS] Non-JSON response for ${endpoint}:`, text.substring(0, 200));
+      return res.status(500).json({ error: 'USGS returned invalid response' });
     }
 
+    if (data.errorCode) {
+      console.error(`[USGS] ${endpoint} → errorCode: ${data.errorCode}`);
+      // If unauthorized, reset cached key and retry once
+      if (data.errorCode === 'UNAUTHORIZED_USER' || data.errorCode === 'AUTH_INVALID') {
+        console.log('[USGS] Resetting API key and retrying...');
+        usgsApiKey = null;
+        usgsApiKeyExpiry = null;
+        const newKey = await getUsgsApiKey();
+        const retry = await fetch(`${USGS_API}/${endpoint}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Auth-Token': newKey
+          },
+          body: JSON.stringify(req.body)
+        });
+        const retryData = await retry.json();
+        console.log(`[USGS] ${endpoint} retry → status ${retry.status}`);
+        return res.status(retry.status).json(retryData);
+      }
+    }
+
+    console.log(`[USGS] ${endpoint} → status ${response.status}`);
+    res.status(response.status).json(data);
+
   } catch (err) {
-    console.error(`[USGS] ${endpoint} network error:`, err.message);
-    res.status(500).json({
-      errorCode: 'NETWORK_ERROR',
-      errorMessage: 'Cannot reach USGS: ' + err.message,
-    });
+    console.error(`[USGS] ${endpoint} error:`, err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── Start Server ───────────────────────────────────────────────
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log(`✅ SatelliteApp Proxy running on port ${PORT}`);
   console.log(`   USGS user configured: ${!!USGS_USERNAME}`);
   console.log(`   USGS token configured: ${!!USGS_TOKEN}`);
-  console.log(`   App credentials configured: ${!!(APP_USERNAME && APP_PASSWORD)}`);
+  console.log(`   App credentials configured: ${!!APP_USERNAME}`);
 });
