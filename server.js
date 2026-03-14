@@ -73,6 +73,151 @@ async function getSentinelToken() {
   return sentinelToken;
 }
 
+/**
+ * Calculates the minimum pixel width/height required for Sentinel Hub API calls
+ * so that resolution never exceeds maxResMPerPx (default 1400 m/px for S2L2A).
+ *
+ * Scientific basis:
+ *   1 degree latitude  ≈ 111,320 metres
+ *   1 degree longitude ≈ 111,320 × cos(latitude) metres
+ *
+ * @param {object} bbox  - { lat1, lon1, lat2, lon2 }
+ * @param {number} maxDim - Maximum pixels in any dimension (default 512, cap for cost)
+ * @param {number} maxResMPerPx - Max metres per pixel allowed (1400 for S2L2A safety margin)
+ * @returns {{ width: number, height: number }}
+ */
+function calcSentinelDimensions(bbox, maxDim, maxResMPerPx) {
+  maxDim = maxDim || 512;
+  maxResMPerPx = maxResMPerPx || 1400; // 1400 not 1500 — safety margin
+
+  const midLat = (bbox.lat1 + bbox.lat2) / 2;
+  const metersPerDegLat = 111320;
+  const metersPerDegLon = 111320 * Math.cos(midLat * Math.PI / 180);
+
+  const widthM  = Math.abs(bbox.lon2 - bbox.lon1) * metersPerDegLon;
+  const heightM = Math.abs(bbox.lat2 - bbox.lat1) * metersPerDegLat;
+
+  // Minimum pixels to stay under maxResMPerPx
+  const minW = Math.ceil(widthM  / maxResMPerPx) + 2;
+  const minH = Math.ceil(heightM / maxResMPerPx) + 2;
+
+  // Cap at maxDim (to control processing cost), but never go below minimum
+  const width  = Math.min(maxDim, Math.max(minW, 32));
+  const height = Math.min(maxDim, Math.max(minH, 32));
+
+  console.log(`[DIMS] BBox: ${(widthM/1000).toFixed(1)}km×${(heightM/1000).toFixed(1)}km → ${width}×${height}px (${(widthM/width).toFixed(0)}m/px)`);
+  return { width, height };
+}
+
+function getProcessEvalscript(indexName) {
+  const SCRIPTS = {
+    NDVI: {
+      bands: ["B04","B08"],
+      compute: "let v=(s.B08-s.B04)/(s.B08+s.B04+1e-6);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    NDWI: {
+      bands: ["B03","B08"],
+      compute: "let v=(s.B03-s.B08)/(s.B03+s.B08+1e-6);",
+      colors: "colorBlend(v,[-0.6,-0.3,0,0.2,0.4,0.6],[[0.94,0.97,1],[0.75,0.89,0.97],[0.50,0.74,0.90],[0.22,0.55,0.80],[0.06,0.35,0.67],[0,0.19,0.52]])"
+    },
+    MNDWI: {
+      bands: ["B03","B11"],
+      compute: "let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);",
+      colors: "colorBlend(v,[-0.6,-0.3,0,0.2,0.4,0.6],[[0.94,0.97,1],[0.75,0.89,0.97],[0.50,0.74,0.90],[0.22,0.55,0.80],[0.06,0.35,0.67],[0,0.19,0.52]])"
+    },
+    NDBI: {
+      bands: ["B08","B11"],
+      compute: "let v=(s.B11-s.B08)/(s.B11+s.B08+1e-6);",
+      colors: "colorBlend(v,[-0.5,-0.2,0,0.2,0.4,0.6],[[0.13,0.55,0.13],[0.56,0.73,0.56],[0.96,0.96,0.86],[0.85,0.75,0.50],[0.70,0.50,0.20],[0.55,0.25,0.08]])"
+    },
+    EVI: {
+      bands: ["B02","B04","B08"],
+      compute: "let v=2.5*(s.B08-s.B04)/(s.B08+6*s.B04-7.5*s.B02+1+1e-6);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    SAVI: {
+      bands: ["B04","B08"],
+      compute: "let v=1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5+1e-6);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    GNDVI: {
+      bands: ["B03","B08"],
+      compute: "let v=(s.B08-s.B03)/(s.B08+s.B03+1e-6);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    NDMI: {
+      bands: ["B08","B11"],
+      compute: "let v=(s.B08-s.B11)/(s.B08+s.B11+1e-6);",
+      colors: "colorBlend(v,[-0.8,-0.4,0,0.2,0.4,0.8],[[0.92,0.76,0.45],[0.98,0.94,0.82],[0.92,0.97,1.0],[0.55,0.82,0.97],[0.14,0.59,0.90],[0,0.25,0.62]])"
+    },
+    NDBaI: {
+      bands: ["B11","B12"],
+      compute: "let v=(s.B11-s.B12)/(s.B11+s.B12+1e-6);",
+      colors: "colorBlend(v,[-0.6,-0.3,0,0.2,0.4,0.6],[[0.13,0.55,0.13],[0.64,0.84,0.64],[0.97,0.97,0.88],[0.94,0.82,0.55],[0.76,0.54,0.22],[0.55,0.27,0.07]])"
+    },
+    BSI: {
+      bands: ["B02","B04","B08","B11"],
+      compute: "let v=((s.B11+s.B04)-(s.B08+s.B02))/((s.B11+s.B04)+(s.B08+s.B02)+1e-6);",
+      colors: "colorBlend(v,[-0.6,-0.3,0,0.1,0.3,0.5],[[0.13,0.55,0.13],[0.64,0.84,0.64],[0.96,0.96,0.86],[0.94,0.82,0.55],[0.76,0.54,0.22],[0.55,0.27,0.07]])"
+    },
+    NDRE: {
+      bands: ["B04","B05"],
+      compute: "let v=(s.B05-s.B04)/(s.B05+s.B04+1e-6);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    NDSI: {
+      bands: ["B03","B11"],
+      compute: "let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);",
+      colors: "colorBlend(v,[-0.6,-0.3,0,0.2,0.4,0.8],[[0.65,0.33,0.16],[0.86,0.63,0.40],[0.98,0.92,0.84],[0.80,0.93,0.97],[0.55,0.85,0.97],[0.95,0.97,1.0]])"
+    },
+    OSAVI: {
+      bands: ["B04","B08"],
+      compute: "let v=(s.B08-s.B04)/(s.B08+s.B04+0.16);",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    MSAVI: {
+      bands: ["B04","B08"],
+      compute: "let x=2*s.B08+1; let v=(x-Math.sqrt(Math.max(0,x*x-8*(s.B08-s.B04))))/2;",
+      colors: "colorBlend(v,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]])"
+    },
+    CMRI: {
+      bands: ["B03","B04","B08","B11"],
+      compute: "let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=ndvi-mndwi;",
+      colors: "colorBlend(v,[-1.5,-0.5,0,0.5,1.0,1.5],[[0.0,0.19,0.52],[0.22,0.55,0.80],[0.90,0.90,0.65],[0.46,0.72,0.26],[0.08,0.53,0.08],[0,0.3,0]])"
+    },
+    MMRI: {
+      bands: ["B03","B04","B08","B11"],
+      compute: "let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=Math.abs(mndwi)/(Math.abs(mndwi)+Math.abs(ndvi)+1e-6);",
+      colors: "colorBlend(v,[0,0.2,0.4,0.6,0.8,1.0],[[0.94,0.97,1],[0.58,0.80,0.92],[0.16,0.58,0.73],[0.04,0.39,0.27],[0.02,0.27,0.16],[0,0.15,0.08]])"
+    },
+    MVI: {
+      bands: ["B03","B08","B11"],
+      compute: "let denom=s.B11-s.B03; let v=(Math.abs(denom)<1e-6)?0:(s.B08-s.B03)/denom; v=Math.max(0,Math.min(10,v));",
+      colors: "colorBlend(v,[0,1,2,4,6,10],[[0.98,0.92,0.84],[0.80,0.91,0.66],[0.46,0.72,0.26],[0.16,0.55,0.16],[0.04,0.38,0.12],[0,0.20,0.05]])"
+    },
+  };
+
+  const cfg = SCRIPTS[indexName] || SCRIPTS['NDVI'];
+  const bandsInput = cfg.bands.map(b => `"${b}"`).join(',');
+
+  // CRITICAL: 4-channel RGBA output so no-data pixels are transparent (not white)
+  return `//VERSION=3
+function setup() {
+  return {
+    input: [{ bands: [${bandsInput},"dataMask"], units: "REFLECTANCE" }],
+    output: { bands: 4, sampleType: "AUTO" }
+  };
+}
+function evaluatePixel(s) {
+  if (!s.dataMask) return [0.16, 0.16, 0.20, 0];
+  ${cfg.compute}
+  if (isNaN(v) || !isFinite(v)) return [0.16, 0.16, 0.20, 0];
+  let rgb = ${cfg.colors};
+  return [...rgb, 1];
+}`;
+}
+
 // ── JWT auth middleware ─────────────────────────────────────────
 function requireAuth(req, res) {
   const authHeader = req.headers.authorization;
@@ -147,110 +292,132 @@ app.post('/usgs/:endpoint', async (req, res) => {
 
 // ── Sentinel Hub Index Map (FIXED evalscript) ───────────────────
 app.post('/sentinel/map', async (req, res) => {
-  const decoded = requireAuth(req, res); if (!decoded) return;
-  const { bbox, date, indexName, width = 512, height = 512, cloudCover } = req.body;
-  if (!bbox || !date || !indexName) return res.status(400).json({ error: 'bbox, date, indexName required' });
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
+  try { jwt.verify(authHeader.split(' ')[1], JWT_SECRET); } catch(e) { return res.status(401).json({ error: 'Invalid token' }); }
 
-  const evalscripts = {
-    NDVI:  'return colorBlend((B08-B04)/(B08+B04),[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    NDWI:  'return colorBlend((B03-B08)/(B03+B08),[-0.6,-0.3,0,0.2,0.4,0.6],[[0.94,0.97,1],[0.75,0.89,0.97],[0.50,0.74,0.90],[0.22,0.55,0.80],[0.06,0.35,0.67],[0,0.19,0.52]]);',
-    NDBI:  'return colorBlend((B11-B08)/(B11+B08),[-0.5,-0.2,0,0.2,0.4,0.6],[[0.13,0.55,0.13],[0.56,0.73,0.56],[0.96,0.96,0.86],[0.85,0.75,0.50],[0.70,0.50,0.20],[0.55,0.25,0.08]]);',
-    EVI:   'let evi=2.5*(B08-B04)/(B08+6*B04-7.5*B02+1); return colorBlend(evi,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    SAVI:  'let savi=((B08-B04)/(B08+B04+0.5))*1.5; return colorBlend(savi,[-0.2,0,0.2,0.4,0.6,0.9],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    MNDWI: 'return colorBlend((B03-B11)/(B03+B11),[-0.6,-0.3,0,0.2,0.4,0.6],[[0.94,0.97,1],[0.75,0.89,0.97],[0.50,0.74,0.90],[0.22,0.55,0.80],[0.06,0.35,0.67],[0,0.19,0.52]]);',
-    NDMI:  'return colorBlend((B08-B11)/(B08+B11),[-0.5,-0.2,0,0.2,0.4,0.6],[[0.85,0.75,0.50],[0.90,0.90,0.80],[0.95,0.95,0.90],[0.56,0.82,0.56],[0.18,0.65,0.40],[0,0.5,0.2]]);',
-    BSI:   'let bsi=((B11+B04)-(B08+B02))/((B11+B04)+(B08+B02)); return colorBlend(bsi,[-0.4,-0.1,0,0.1,0.3,0.5],[[0.13,0.55,0.13],[0.50,0.73,0.50],[0.96,0.96,0.86],[0.85,0.75,0.50],[0.70,0.50,0.20],[0.55,0.25,0.08]]);',
-    OSAVI: 'let osavi=(B08-B04)/(B08+B04+0.16); return colorBlend(osavi,[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    MSAVI: 'let x=(2*B08+1);let msavi=(x-Math.sqrt(Math.max(0,x*x-8*(B08-B04))))/2; return colorBlend(msavi,[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    NDSI:  'return colorBlend((B03-B11)/(B03+B11),[-0.5,-0.2,0,0.2,0.5,0.8],[[0.55,0.25,0.08],[0.85,0.75,0.50],[0.96,0.96,0.86],[0.80,0.90,1.0],[0.50,0.75,1.0],[0.30,0.55,0.90]]);',
-    GNDVI: 'return colorBlend((B08-B03)/(B08+B03),[-0.2,0,0.2,0.4,0.6,0.8],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    NDRE:  'return colorBlend((B06-B04)/(B06+B04),[-0.2,0,0.1,0.3,0.5,0.7],[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    NDBaI: 'return colorBlend((B11-B12)/(B11+B12),[-0.4,-0.1,0,0.1,0.3,0.5],[[0.13,0.55,0.13],[0.50,0.73,0.50],[0.96,0.96,0.86],[0.85,0.75,0.50],[0.70,0.50,0.20],[0.55,0.25,0.08]]);',
-    MVI:   'let mvi=(B08-B03)/(B11-B03+0.0001); return colorBlend(mvi,[0,2,4,6,10,20],[[0.96,0.96,0.86],[0.70,0.88,0.70],[0.40,0.75,0.40],[0.18,0.65,0.18],[0,0.50,0],[0,0.30,0]]);',
-    CMRI:  'let ndvi2=(B08-B04)/(B08+B04);let mndwi2=(B03-B11)/(B03+B11);let cmri=ndvi2-mndwi2;return colorBlend(cmri,[-1,-0.3,0,0.3,0.6,1.2],[[0.06,0.35,0.67],[0.50,0.74,0.90],[0.96,0.96,0.86],[0.56,0.82,0.31],[0.18,0.65,0.18],[0,0.4,0]]);',
-    MMRI:  'let ndvi3=(B08-B04)/(B08+B04);let mndwi3=(B03-B11)/(B03+B11);let mmri=Math.abs(mndwi3)/(Math.abs(mndwi3)+Math.abs(ndvi3)+0.0001);return colorBlend(mmri,[0,0.2,0.4,0.6,0.8,1],[[0,0.4,0],[0.18,0.65,0.18],[0.56,0.82,0.31],[1,1,0.88],[0.50,0.74,0.90],[0.06,0.35,0.67]]);',
-    UTFVI: 'return [B04*3, B03*3, B02*3];',
+  const { bbox, indexName } = req.body;
+  // date is optional — if not provided, use "most recent available" via wide window
+  const requestedDate = req.body.date; // optional YYYY-MM-DD
+
+  if (!bbox || !indexName) return res.status(400).json({ error: 'bbox and indexName required' });
+
+  // UTFVI requires thermal band not in S2 — reject gracefully
+  if (indexName === 'UTFVI') {
+    return res.status(400).json({ error: 'UTFVI requires Landsat thermal band (B10), which is not available in Sentinel-2. Please use NDBaI or BSI as a soil/surface alternative.' });
+  }
+
+  // Calculate dimensions dynamically — FIX FOR RESOLUTION ERROR
+  const { width, height } = calcSentinelDimensions(bbox, 512, 1400);
+
+  // Date range: use ±20 days around requested date, or last 30 days if no date given
+  let fromDate, toDate;
+  if (requestedDate) {
+    const d = new Date(requestedDate);
+    const from = new Date(d); from.setDate(d.getDate() - 20);
+    const to   = new Date(d); to.setDate(d.getDate() + 20);
+    fromDate = from.toISOString().split('T')[0] + 'T00:00:00Z';
+    toDate   = to.toISOString().split('T')[0]   + 'T23:59:59Z';
+  } else {
+    const now = new Date();
+    const from = new Date(now); from.setDate(now.getDate() - 30);
+    fromDate = from.toISOString().split('T')[0] + 'T00:00:00Z';
+    toDate   = now.toISOString().split('T')[0]  + 'T23:59:59Z';
+  }
+
+  const rawEvalscript = getProcessEvalscript(indexName);
+
+  const payload = {
+    input: {
+      bounds: {
+        bbox: [bbox.lon1, bbox.lat1, bbox.lon2, bbox.lat2],
+        properties: { crs: 'http://www.opengis.net/def/crs/EPSG/0/4326' }
+      },
+      data: [{
+        type: 'sentinel-2-l2a',
+        dataFilter: {
+          timeRange: { from: fromDate, to: toDate },
+          maxCloudCoverage: 60,
+          mosaickingOrder: 'leastCC'  // prefer least cloud cover in date range
+        }
+      }]
+    },
+    output: {
+      width,
+      height,
+      responses: [{ identifier: 'default', format: { type: 'image/png' } }]
+    },
+    evalscript: rawEvalscript  // ← PLAIN TEXT, never base64 or data URI
   };
-
-  const script = evalscripts[indexName] || evalscripts['NDVI'];
-  // Build bands list based on what the script uses
-  const allBands = ["B02","B03","B04","B06","B08","B11","B12"];
-  const usedBands = allBands.filter(b => script.includes(b));
-  if (usedBands.length === 0) usedBands.push("B02","B03","B04","B08","B11");
-
-  // FIXED: evalscript is PLAIN TEXT, NOT base64, NOT data URI
-  const evalscript = `//VERSION=3
-function setup(){return{input:[${usedBands.map(b=>'"'+b+'"').join(',')}],output:{bands:3}}}
-function evaluatePixel(s){let ${usedBands.map(b=>b+'=s.'+b).join(',')};${script}}`;
-
-  const maxCloud = typeof cloudCover === 'number' ? cloudCover : 100;
 
   try {
     const token = await getSentinelToken();
-    const payload = {
-      input: {
-        bounds: { bbox: [bbox.lon1,bbox.lat1,bbox.lon2,bbox.lat2], properties:{crs:'http://www.opengis.net/def/crs/EPSG/0/4326'} },
-        data: [{ type:'sentinel-2-l2a', dataFilter:{ timeRange:{ from:date+'T00:00:00Z', to:date+'T23:59:59Z' }, maxCloudCoverage: maxCloud }}]
-      },
-      output: { width, height, responses:[{ identifier:'default', format:{ type:'image/png' }}] },
-      evalscript: evalscript
-    };
-    console.log(`[SENTINEL/MAP] ${indexName} for ${date}, cloud<=${maxCloud}%`);
     const imgRes = await fetch('https://services.sentinel-hub.com/api/v1/process', {
-      method:'POST', headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}, body:JSON.stringify(payload)
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
     });
+
     if (!imgRes.ok) {
-      const e = await imgRes.text();
-      console.error('[SENTINEL/MAP] Error:', e.substring(0,300));
-      return res.status(imgRes.status).json({ error: 'Sentinel: ' + e.substring(0,300) });
+      const errText = await imgRes.text();
+      console.error('[SENTINEL MAP] Error:', errText.substring(0, 300));
+      return res.status(imgRes.status).json({ error: 'Sentinel map error: ' + errText.substring(0, 200) });
     }
+
     const base64 = Buffer.from(await imgRes.arrayBuffer()).toString('base64');
-    res.json({ image: base64, mimeType: 'image/png' });
+    res.json({ image: base64, mimeType: 'image/png', width, height, bbox });
   } catch(err) {
-    console.error('[SENTINEL/MAP] Error:', err.message);
+    console.error('[SENTINEL MAP] Fetch error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Sentinel Hub Statistics API (NEW — real index values) ───────
-const INDEX_EVALSCRIPTS = {
-  NDVI:  { bands:["B04","B08"],            script:"let v=(s.B08-s.B04)/(s.B08+s.B04+1e-6);" },
-  NDWI:  { bands:["B03","B08"],            script:"let v=(s.B03-s.B08)/(s.B03+s.B08+1e-6);" },
-  MNDWI: { bands:["B03","B11"],            script:"let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);" },
-  NDBI:  { bands:["B08","B11"],            script:"let v=(s.B11-s.B08)/(s.B11+s.B08+1e-6);" },
-  EVI:   { bands:["B02","B04","B08"],      script:"let v=2.5*(s.B08-s.B04)/(s.B08+6*s.B04-7.5*s.B02+1+1e-6);" },
-  SAVI:  { bands:["B04","B08"],            script:"let v=1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5+1e-6);" },
-  GNDVI: { bands:["B03","B08"],            script:"let v=(s.B08-s.B03)/(s.B08+s.B03+1e-6);" },
-  NDMI:  { bands:["B08","B11"],            script:"let v=(s.B08-s.B11)/(s.B08+s.B11+1e-6);" },
-  BSI:   { bands:["B02","B04","B08","B11"],script:"let v=((s.B11+s.B04)-(s.B08+s.B02))/((s.B11+s.B04)+(s.B08+s.B02)+1e-6);" },
-  NDSI:  { bands:["B03","B11"],            script:"let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);" },
-  OSAVI: { bands:["B04","B08"],            script:"let v=(s.B08-s.B04)/(s.B08+s.B04+0.16);" },
-  MSAVI: { bands:["B04","B08"],            script:"let x=(2*s.B08+1);let v=(x-Math.sqrt(Math.max(0,x*x-8*(s.B08-s.B04))))/2;" },
-  NDRE:  { bands:["B04","B06"],            script:"let v=(s.B06-s.B04)/(s.B06+s.B04+1e-6);" },
-  NDBaI: { bands:["B11","B12"],            script:"let v=(s.B11-s.B12)/(s.B11+s.B12+1e-6);" },
-  CMRI:  { bands:["B03","B04","B08","B11"],script:"let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=ndvi-mndwi;" },
-  MMRI:  { bands:["B03","B04","B08","B11"],script:"let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=Math.abs(mndwi)/(Math.abs(mndwi)+Math.abs(ndvi)+1e-6);" },
-  MVI:   { bands:["B03","B08","B11"],      script:"let v=(s.B08-s.B03)/(s.B11-s.B03+1e-6);" },
-  UTFVI: { bands:["B04","B08","B11"],      script:"let v=(s.B11-s.B08)/(s.B11+s.B08+1e-6);" },
+const STATS_SCRIPTS = {
+  NDVI:  { bands:["B04","B08"],             script:"let v=(s.B08-s.B04)/(s.B08+s.B04+1e-6);" },
+  NDWI:  { bands:["B03","B08"],             script:"let v=(s.B03-s.B08)/(s.B03+s.B08+1e-6);" },
+  MNDWI: { bands:["B03","B11"],             script:"let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);" },
+  NDBI:  { bands:["B08","B11"],             script:"let v=(s.B11-s.B08)/(s.B11+s.B08+1e-6);" },
+  EVI:   { bands:["B02","B04","B08"],       script:"let v=2.5*(s.B08-s.B04)/(s.B08+6*s.B04-7.5*s.B02+1+1e-6);v=Math.max(-1,Math.min(2,v));" },
+  SAVI:  { bands:["B04","B08"],             script:"let v=1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5+1e-6);" },
+  GNDVI: { bands:["B03","B08"],             script:"let v=(s.B08-s.B03)/(s.B08+s.B03+1e-6);" },
+  NDMI:  { bands:["B08","B11"],             script:"let v=(s.B08-s.B11)/(s.B08+s.B11+1e-6);" },
+  BSI:   { bands:["B02","B04","B08","B11"], script:"let v=((s.B11+s.B04)-(s.B08+s.B02))/((s.B11+s.B04)+(s.B08+s.B02)+1e-6);" },
+  NDSI:  { bands:["B03","B11"],             script:"let v=(s.B03-s.B11)/(s.B03+s.B11+1e-6);" },
+  OSAVI: { bands:["B04","B08"],             script:"let v=(s.B08-s.B04)/(s.B08+s.B04+0.16);" },
+  MSAVI: { bands:["B04","B08"],             script:"let x=2*s.B08+1;let v=(x-Math.sqrt(Math.max(0,x*x-8*(s.B08-s.B04))))/2;" },
+  NDBaI: { bands:["B11","B12"],             script:"let v=(s.B11-s.B12)/(s.B11+s.B12+1e-6);" },
+  NDRE:  { bands:["B04","B05"],             script:"let v=(s.B05-s.B04)/(s.B05+s.B04+1e-6);" },
+  CMRI:  { bands:["B03","B04","B08","B11"], script:"let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=ndvi-mndwi;" },
+  MMRI:  { bands:["B03","B04","B08","B11"], script:"let ndvi=(s.B08-s.B04)/(s.B08+s.B04+1e-6);let mndwi=(s.B03-s.B11)/(s.B03+s.B11+1e-6);let v=Math.abs(mndwi)/(Math.abs(mndwi)+Math.abs(ndvi)+1e-6);" },
+  MVI:   { bands:["B03","B08","B11"],       script:"let denom=s.B11-s.B03;let v=Math.abs(denom)<1e-6?0:(s.B08-s.B03)/denom;v=Math.max(0,Math.min(20,v));" },
 };
 
 app.post('/sentinel/statistics', async (req, res) => {
-  const decoded = requireAuth(req, res); if (!decoded) return;
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
+  try { jwt.verify(authHeader.split(' ')[1], JWT_SECRET); } catch(e) { return res.status(401).json({ error: 'Invalid token' }); }
+
   const { bbox, aoiGeometry, indexName, startDate, endDate, interval } = req.body;
   if (!bbox || !indexName || !startDate || !endDate) {
     return res.status(400).json({ error: 'bbox, indexName, startDate, endDate required' });
   }
 
-  const idxConfig = INDEX_EVALSCRIPTS[indexName];
-  if (!idxConfig) return res.status(400).json({ error: `Unknown index: ${indexName}` });
+  if (indexName === 'UTFVI') {
+    return res.status(400).json({ error: 'UTFVI requires Landsat thermal band (B10) not available in Sentinel-2. Use NDBaI instead.' });
+  }
 
-  const bandsInput = idxConfig.bands.map(b => `"${b}"`).join(',');
-  const validChecks = idxConfig.bands.map(b => `s.${b} > 0`).join(' && ');
+  const cfg = STATS_SCRIPTS[indexName];
+  if (!cfg) return res.status(400).json({ error: `Unknown index: ${indexName}` });
 
-  const evalscript = `//VERSION=3
+  // Dynamic dimensions — THE FIX
+  const { width, height } = calcSentinelDimensions(bbox, 512, 1400);
+
+  const bandsInput = cfg.bands.map(b => `"${b}"`).join(',');
+  const rawEvalscript = `//VERSION=3
 function setup() {
   return {
-    input: [{ bands: [${bandsInput}], units: "REFLECTANCE" }],
+    input: [{ bands: [${bandsInput},"dataMask"], units: "REFLECTANCE" }],
     output: [
       { id: "data", bands: 1, sampleType: "FLOAT32" },
       { id: "dataMask", bands: 1 }
@@ -258,56 +425,72 @@ function setup() {
   };
 }
 function evaluatePixel(s) {
-  ${idxConfig.script}
-  let valid = (${validChecks}) ? 1 : 0;
-  return { data: [isNaN(v) ? 0 : v], dataMask: [valid] };
+  if (!s.dataMask) return { data: [0], dataMask: [0] };
+  ${cfg.script}
+  if (isNaN(v) || !isFinite(v)) return { data: [0], dataMask: [0] };
+  return { data: [v], dataMask: [1] };
 }`;
 
   const bounds = aoiGeometry
-    ? { geometry: aoiGeometry, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } }
-    : { bbox: [bbox.lon1, bbox.lat1, bbox.lon2, bbox.lat2], properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } };
+    ? { geometry: aoiGeometry, properties: { crs: 'http://www.opengis.net/def/crs/EPSG/0/4326' } }
+    : { bbox: [bbox.lon1, bbox.lat1, bbox.lon2, bbox.lat2], properties: { crs: 'http://www.opengis.net/def/crs/EPSG/0/4326' } };
 
   const payload = {
     input: {
       bounds,
       data: [{
-        type: "sentinel-2-l2a",
+        type: 'sentinel-2-l2a',
         dataFilter: {
-          timeRange: { from: startDate + "T00:00:00Z", to: endDate + "T23:59:59Z" },
-          maxCloudCoverage: 80
+          timeRange: { from: startDate + 'T00:00:00Z', to: endDate + 'T23:59:59Z' },
+          maxCloudCoverage: 70
         }
       }]
     },
     aggregation: {
-      timeRange: { from: startDate + "T00:00:00Z", to: endDate + "T23:59:59Z" },
-      aggregationInterval: { of: interval || "P1M" },
-      width: 100,
-      height: 100,
-      evalscript: evalscript
+      timeRange: { from: startDate + 'T00:00:00Z', to: endDate + 'T23:59:59Z' },
+      aggregationInterval: { of: interval || 'P1M' },
+      width,
+      height,
+      evalscript: rawEvalscript  // ← PLAIN TEXT
     },
-    calculations: { default: {} }
+    calculations: { default: { histograms: {}, statistics: {} } }
   };
 
   try {
     const token = await getSentinelToken();
-    console.log(`[SENTINEL/STATS] ${indexName} ${startDate} to ${endDate} interval=${interval||'P1M'}`);
     const statRes = await fetch('https://services.sentinel-hub.com/api/v1/statistics', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+
     const rawText = await statRes.text();
     let data;
-    try { data = JSON.parse(rawText); }
-    catch(e) { return res.status(500).json({ error: 'Sentinel non-JSON: ' + rawText.substring(0,200) }); }
-    if (!statRes.ok) {
-      console.error('[SENTINEL/STATS] Error:', JSON.stringify(data).substring(0,300));
-      return res.status(statRes.status).json({ error: 'Sentinel Stats error: ' + JSON.stringify(data).substring(0,300) });
+    try { data = JSON.parse(rawText); } catch(e) {
+      return res.status(500).json({ error: 'Sentinel Stats returned non-JSON: ' + rawText.substring(0, 200) });
     }
-    console.log(`[SENTINEL/STATS] Got ${(data.data || []).length} intervals`);
-    res.json({ success: true, data: data.data || [] });
+
+    if (!statRes.ok) {
+      return res.status(statRes.status).json({ error: 'Sentinel Stats error: ' + JSON.stringify(data).substring(0, 300) });
+    }
+
+    // Extract clean data points from the Statistics API response
+    const points = (data.data || []).map(interval => {
+      const stats = interval?.outputs?.data?.bands?.B0?.stats;
+      if (!stats || stats.sampleCount === 0 || stats.noDataCount === stats.sampleCount) return null;
+      return {
+        date: interval.interval?.from?.split('T')[0] || '',
+        mean:     parseFloat(stats.mean?.toFixed(4)  || 0),
+        min:      parseFloat(stats.min?.toFixed(4)   || 0),
+        max:      parseFloat(stats.max?.toFixed(4)   || 0),
+        stDev:    parseFloat(stats.stDev?.toFixed(4) || 0),
+        count:    stats.sampleCount - stats.noDataCount,
+      };
+    }).filter(p => p !== null);
+
+    res.json({ success: true, indexName, points, totalIntervals: data.data?.length || 0 });
   } catch(err) {
-    console.error('[SENTINEL/STATS] Error:', err.message);
+    console.error('[SENTINEL STATS] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -315,6 +498,4 @@ function evaluatePixel(s) {
 app.listen(PORT, () => {
   console.log(`SatelliteApp Proxy on port ${PORT}`);
   console.log(`USGS queue: ENABLED`);
-  console.log(`Sentinel Hub: ${!!(SENTINEL_CLIENT_ID && SENTINEL_CLIENT_SECRET)}`);
-  console.log(`Statistics API: ENABLED`);
 });
