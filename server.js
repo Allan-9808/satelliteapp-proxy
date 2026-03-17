@@ -45,7 +45,8 @@ const BAND_MAP = {
     NIR: 'B08', SWIR1: 'B11', SWIR2: 'B12',
     hubType: 'sentinel-2-l2a',
     hasRedEdge: true,
-    label: 'Sentinel-2'
+    label: 'Sentinel-2',
+    baseUrl: 'https://services.sentinel-hub.com'
   },
   'landsat': {
     BLUE: 'B02', GREEN: 'B03', RED: 'B04',
@@ -53,7 +54,8 @@ const BAND_MAP = {
     NIR: 'B05', SWIR1: 'B06', SWIR2: 'B07',
     hubType: 'landsat-ot-l2',
     hasRedEdge: false,
-    label: 'Landsat 8/9'
+    label: 'Landsat 8/9',
+    baseUrl: 'https://services-uswest2.sentinel-hub.com'
   }
 };
 
@@ -402,7 +404,7 @@ app.post('/sentinel/map', async (req, res) => {
 
   try {
     const token = await getSentinelToken();
-    const imgRes = await fetch('https://services.sentinel-hub.com/api/v1/process', {
+    const imgRes = await fetch(`${ds.baseUrl}/api/v1/process`, {
       method:'POST', headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}, body:JSON.stringify(payload)
     });
     if (!imgRes.ok) { const e = await imgRes.text(); return res.status(imgRes.status).json({ error: 'Sentinel map failed: ' + e.slice(0,300) }); }
@@ -460,7 +462,7 @@ app.post('/sentinel/statistics', async (req, res) => {
 
   try {
     const token = await getSentinelToken();
-    const r = await fetch('https://services.sentinel-hub.com/api/v1/statistics', {
+    const r = await fetch(`${ds.baseUrl}/api/v1/statistics`, {
       method:'POST', headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}, body:JSON.stringify(payload)
     });
     let data; try { data = JSON.parse(await r.text()); } catch(e) { return res.status(500).json({ error:'Sentinel non-JSON response' }); }
@@ -530,7 +532,7 @@ app.get('/sentinel/tiles/:z/:x/:y', async (req, res) => {
 
   try {
     const token = await getSentinelToken();
-    const imgRes = await fetch('https://services.sentinel-hub.com/api/v1/process', {
+    const imgRes = await fetch(`${ds.baseUrl}/api/v1/process`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
