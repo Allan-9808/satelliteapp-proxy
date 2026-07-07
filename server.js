@@ -35,9 +35,13 @@ function queueUsgs(fn) {
   return p;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// DYNAMIC BAND MAPPING — Sentinel-2 ↔ Landsat 8/9
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
+// DYNAMIC BAND MAPPING - Sentinel-2  Landsat 8/9
+// ------------------------------------------------------------------------------
+// Data host: free Copernicus Data Space Ecosystem (CDSE) - sh.dataspace.copernicus.eu
+// CDSE serves Sentinel-2 only. Landsat collections live on the paid Planet/Sentinel Hub
+// service, so Landsat index analysis is blocked (shAvailable:false). USGS scene search
+// is unaffected - it goes through /usgs, not Sentinel Hub.
 const BAND_MAP = {
   'sentinel-2': {
     BLUE: 'B02', GREEN: 'B03', RED: 'B04',
@@ -45,8 +49,9 @@ const BAND_MAP = {
     NIR: 'B08', SWIR1: 'B11', SWIR2: 'B12',
     hubType: 'sentinel-2-l2a',
     hasRedEdge: true,
+    shAvailable: true,
     label: 'Sentinel-2',
-    baseUrl: 'https://services.sentinel-hub.com'
+    baseUrl: 'https://sh.dataspace.copernicus.eu'
   },
   'landsat': {
     BLUE: 'B02', GREEN: 'B03', RED: 'B04',
@@ -54,12 +59,15 @@ const BAND_MAP = {
     NIR: 'B05', SWIR1: 'B06', SWIR2: 'B07',
     hubType: 'landsat-ot-l2',
     hasRedEdge: false,
+    shAvailable: false,
     label: 'Landsat 8/9',
     baseUrl: 'https://services-uswest2.sentinel-hub.com'
   }
 };
 
-// Indices that REQUIRE Red-Edge bands — cannot run on Landsat
+const LANDSAT_BLOCK_MSG = 'Landsat index analysis is not available on the free Copernicus (CDSE) plan - CDSE only hosts Sentinel data. Please go back and switch the dataset to Sentinel-2A (all indices work there). Landsat scene search still works.';
+
+// Indices that REQUIRE Red-Edge bands - cannot run on Landsat
 const RED_EDGE_INDICES = ['MARINE', 'REMI', 'NDRE'];
 
 function resolveDataset(dsParam) {
@@ -69,22 +77,22 @@ function resolveDataset(dsParam) {
   return BAND_MAP['sentinel-2'];
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 // DYNAMIC PIXEL DIMENSIONS
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 function calcDims(bbox, maxPx = 512, maxRes = 1400) {
   const midLat = (bbox.lat1 + bbox.lat2) / 2;
   const wM = Math.abs(bbox.lon2 - bbox.lon1) * 111320 * Math.cos(midLat * Math.PI / 180);
   const hM = Math.abs(bbox.lat2 - bbox.lat1) * 111320;
   const w  = Math.min(maxPx, Math.max(32, Math.ceil(wM / maxRes) + 2));
   const h  = Math.min(maxPx, Math.max(32, Math.ceil(hM / maxRes) + 2));
-  console.log(`[DIMS] ${(wM/1000).toFixed(0)}km×${(hM/1000).toFixed(0)}km → ${w}×${h}px (${(wM/w).toFixed(0)}m/px)`);
+  console.log(`[DIMS] ${(wM/1000).toFixed(0)}km${(hM/1000).toFixed(0)}km -> ${w}${h}px (${(wM/w).toFixed(0)}m/px)`);
   return { w, h };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 // AUTH HELPERS
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 async function getUsgsKey() {
   if (usgsApiKey && Date.now() < usgsApiKeyExpiry) return usgsApiKey;
   console.log('[USGS] Refreshing API key...');
@@ -103,12 +111,19 @@ async function getUsgsKey() {
 async function getSentinelToken() {
   if (!SENTINEL_ID || !SENTINEL_SEC) throw new Error('Sentinel Hub credentials not configured. Please set SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET on the server.');
   if (sentinelToken && Date.now() < sentinelTokenExpiry) return sentinelToken;
-  const r = await fetch('https://services.sentinel-hub.com/auth/realms/main/protocol/openid-connect/token', {
+  // Free Copernicus Data Space Ecosystem OAuth (register at dataspace.copernicus.eu)
+  const r = await fetch('https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'client_credentials', client_id: SENTINEL_ID, client_secret: SENTINEL_SEC })
   });
   const d = await r.json();
-  if (!d.access_token) throw new Error('Sentinel Hub auth failed: ' + JSON.stringify(d).slice(0, 200));
+  if (!d.access_token) {
+    const detail = JSON.stringify(d).slice(0, 200);
+    if (detail.includes('invalid_client')) {
+      throw new Error('Copernicus (CDSE) rejected the server credentials (invalid_client). Admin: log in to shapps.dataspace.copernicus.eu/dashboard -> User settings -> OAuth clients -> create a new client, then update SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET on Render.');
+    }
+    throw new Error('Copernicus auth failed: ' + detail);
+  }
   sentinelToken = d.access_token;
   sentinelTokenExpiry = Date.now() + (d.expires_in - 60) * 1000;
   console.log('[SENTINEL] Token obtained');
@@ -122,16 +137,16 @@ function requireJwt(req, res) {
   catch(e) { res.status(401).json({ error: 'Invalid token' }); return null; }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// INDEX DEFINITIONS — Dynamic band mapping per dataset
+// ------------------------------------------------------------------------------
+// INDEX DEFINITIONS - Dynamic band mapping per dataset
 // Each index returns { bands: [...], code: 'let v=...' } using actual band names
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 function getIndexConfig(idx, ds) {
   const B = ds; // shorthand for band map
   const b = (name) => B[name]; // resolve band name
 
   const configs = {
-    // ── VEGETATION ──────────────────────────────────────────────────────
+    // -- VEGETATION ------------------------------------------------------
     NDVI: {
       bands: [b('RED'), b('NIR')],
       code: `let v=(s.${b('NIR')}-s.${b('RED')})/(s.${b('NIR')}+s.${b('RED')}+1e-6);`
@@ -157,14 +172,14 @@ function getIndexConfig(idx, ds) {
       code: `let x=2*s.${b('NIR')}+1;let v=(x-Math.sqrt(Math.max(0,x*x-8*(s.${b('NIR')}-s.${b('RED')}))))/2;`
     },
 
-    // ── RED-EDGE VEGETATION (Sentinel-2 only) ──────────────────────────
+    // -- RED-EDGE VEGETATION (Sentinel-2 only) --------------------------
     NDRE: {
       bands: [b('RED'), b('RED_EDGE_1')],
       code: `let v=(s.${b('RED_EDGE_1')}-s.${b('RED')})/(s.${b('RED_EDGE_1')}+s.${b('RED')}+1e-6);`,
       requiresRedEdge: true
     },
 
-    // ── WATER/MOISTURE ─────────────────────────────────────────────────
+    // -- WATER/MOISTURE -------------------------------------------------
     NDWI: {
       bands: [b('GREEN'), b('NIR')],
       code: `let v=(s.${b('GREEN')}-s.${b('NIR')})/(s.${b('GREEN')}+s.${b('NIR')}+1e-6);`
@@ -178,7 +193,7 @@ function getIndexConfig(idx, ds) {
       code: `let v=(s.${b('SWIR2')}-s.${b('GREEN')})/(s.${b('SWIR2')}+s.${b('GREEN')}+1e-6);`
     },
 
-    // ── URBAN/SOIL ─────────────────────────────────────────────────────
+    // -- URBAN/SOIL -----------------------------------------------------
     NDBI: {
       bands: [b('NIR'), b('SWIR1')],
       code: `let v=(s.${b('SWIR1')}-s.${b('NIR')})/(s.${b('SWIR1')}+s.${b('NIR')}+1e-6);`
@@ -192,13 +207,13 @@ function getIndexConfig(idx, ds) {
       code: `let v=((s.${b('SWIR1')}+s.${b('RED')})-(s.${b('NIR')}+s.${b('BLUE')}))/((s.${b('SWIR1')}+s.${b('RED')})+(s.${b('NIR')}+s.${b('BLUE')})+1e-6);`
     },
 
-    // ── SNOW ───────────────────────────────────────────────────────────
+    // -- SNOW -----------------------------------------------------------
     NDSI: {
       bands: [b('GREEN'), b('SWIR1')],
       code: `let v=(s.${b('GREEN')}-s.${b('SWIR1')})/(s.${b('GREEN')}+s.${b('SWIR1')}+1e-6);`
     },
 
-    // ── MANGROVE ───────────────────────────────────────────────────────
+    // -- MANGROVE -------------------------------------------------------
     MVI: {
       bands: [b('GREEN'), b('NIR'), b('SWIR1')],
       code: `let d=s.${b('SWIR1')}-s.${b('GREEN')};let v=Math.abs(d)<1e-6?0:(s.${b('NIR')}-s.${b('GREEN')})/d;v=Math.max(0,Math.min(10,v));`
@@ -212,14 +227,14 @@ function getIndexConfig(idx, ds) {
       code: `let nd=(s.${b('NIR')}-s.${b('RED')})/(s.${b('NIR')}+s.${b('RED')}+1e-6);let mw=(s.${b('GREEN')}-s.${b('SWIR1')})/(s.${b('GREEN')}+s.${b('SWIR1')}+1e-6);let v=Math.abs(mw)/(Math.abs(mw)+Math.abs(nd)+1e-6);`
     },
 
-    // ── REMI (Red-Edge, Sentinel-2 only) ───────────────────────────────
+    // -- REMI (Red-Edge, Sentinel-2 only) -------------------------------
     REMI: {
       bands: [b('GREEN'), b('RED'), b('RED_EDGE_1'), b('SWIR1')],
       code: `let v=(s.${b('RED_EDGE_1')}-s.${b('RED')})/(s.${b('SWIR1')}-s.${b('GREEN')}+1e-6);`,
       requiresRedEdge: true
     },
 
-    // ── MARINE (Red-Edge, Sentinel-2 only) ─────────────────────────────
+    // -- MARINE (Red-Edge, Sentinel-2 only) -----------------------------
     // MARINE = ((B6-B4)/(B11-B3)) * (1 + ((B7-B5)/(B7+B5)))
     MARINE: {
       bands: [b('GREEN'), b('RED'), b('RED_EDGE_1'), b('RED_EDGE_2'), b('RED_EDGE_3'), b('SWIR1')],
@@ -231,11 +246,11 @@ function getIndexConfig(idx, ds) {
   return configs[idx] || null;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 // COLOR RAMP DEFINITIONS (dataset-independent)
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 const COLOR_RAMPS = {
-  // VEGETATION: Brown → Tan → Light Green → Dark Green
+  // VEGETATION: Brown -> Tan -> Light Green -> Dark Green
   NDVI:   { br:'[-0.2,0,0.2,0.4,0.6,0.8]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
   EVI:    { br:'[-0.2,0,0.2,0.4,0.6,0.9]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
   SAVI:   { br:'[-0.2,0,0.2,0.4,0.6,0.9]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
@@ -243,11 +258,11 @@ const COLOR_RAMPS = {
   NDRE:   { br:'[-0.2,0,0.2,0.4,0.6,0.8]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
   OSAVI:  { br:'[-0.2,0,0.2,0.4,0.6,0.9]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
   MSAVI:  { br:'[-0.2,0,0.2,0.4,0.6,0.9]',  cl:'[[.54,.27,.07],[.82,.71,.55],[.96,.96,.86],[.56,.79,.20],[.18,.55,.18],[0,.27,0]]' },
-  // WATER: Tan → Light Blue → Dark Blue
+  // WATER: Tan -> Light Blue -> Dark Blue
   NDWI:   { br:'[-.6,-.3,0,.2,.4,.6]',       cl:'[[.94,.90,.79],[.75,.85,.93],[.50,.74,.90],[.22,.56,.80],[.06,.35,.67],[0,.19,.52]]' },
   MNDWI:  { br:'[-.6,-.3,0,.2,.4,.6]',       cl:'[[.94,.90,.79],[.75,.85,.93],[.50,.74,.90],[.22,.56,.80],[.06,.35,.67],[0,.19,.52]]' },
   NDMI:   { br:'[-.8,-.4,0,.2,.4,.8]',        cl:'[[.92,.76,.45],[.98,.94,.82],[.92,.97,1],[.55,.82,.97],[.14,.59,.9],[0,.25,.62]]' },
-  // URBAN/SOIL: Grey → Tan → Orange → Red (NOT green)
+  // URBAN/SOIL: Grey -> Tan -> Orange -> Red (NOT green)
   NDBI:   { br:'[-.5,-.2,0,.15,.3,.5]',       cl:'[[.50,.50,.50],[.63,.63,.63],[.78,.78,.63],[.83,.63,.31],[.72,.39,.16],[.55,.16,.05]]' },
   NDBaI:  { br:'[-.6,-.3,0,.2,.4,.6]',        cl:'[[.13,.55,.13],[.64,.84,.64],[.97,.97,.88],[.94,.82,.55],[.76,.54,.22],[.55,.27,.07]]' },
   BSI:    { br:'[-.6,-.3,0,.1,.3,.5]',         cl:'[[.13,.55,.13],[.64,.84,.64],[.96,.96,.86],[.94,.82,.55],[.76,.54,.22],[.55,.27,.07]]' },
@@ -262,9 +277,9 @@ const COLOR_RAMPS = {
   MARINE: { br:'[-2,-1,0,1,2,4]',              cl:'[[.55,.16,.05],[.82,.55,.27],[.96,.92,.78],[.40,.72,.40],[.12,.50,.12],[0,.30,.08]]' },
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 // EVALSCRIPT BUILDERS (dynamic per dataset)
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 
 // Map evalscript: renders colored RGBA PNG
 function getMapEvalscript(idx, ds) {
@@ -308,15 +323,16 @@ function evaluatePixel(s){
 }`;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 // ROUTES
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 app.get('/', (_, res) => res.json({
   status:'ok',
-  service:'SatelliteApp Proxy v6 — Dynamic Band Mapping',
+  service:'SatelliteApp Proxy v7 - CDSE (free Copernicus)',
   queueEnabled:true,
   sentinelHub:!!(SENTINEL_ID&&SENTINEL_SEC),
-  supportedDatasets: ['sentinel-2', 'landsat'],
+  supportedDatasets: ['sentinel-2'],
+  landsatAnalysis: 'unavailable on free CDSE plan (USGS scene search still works)',
   redEdgeIndices: RED_EDGE_INDICES
 }));
 
@@ -327,7 +343,7 @@ app.post('/auth/login', (req, res) => {
   res.json({ token: jwt.sign({ username }, JWT_SECRET, { expiresIn: '8h' }), username });
 });
 
-// ─── USGS PROXY ──────────────────────────────────────────────────────────────
+// --- USGS PROXY --------------------------------------------------------------
 app.post('/usgs/:endpoint', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -341,7 +357,7 @@ app.post('/usgs/:endpoint', async (req, res) => {
       }, 45000);
       let r = await call(key), d = JSON.parse(await r.text());
       if (d.errorCode==='CONCURRENT_REQUEST_LIMIT'||(d.errorMessage||'').includes('multiple requests')) {
-        console.log('[USGS] CONCURRENT → waiting 6s, retrying');
+        console.log('[USGS] CONCURRENT -> waiting 6s, retrying');
         await sleep(6000); r = await call(key); d = JSON.parse(await r.text());
       }
       if (d.errorCode==='UNAUTHORIZED_USER'||d.errorCode==='AUTH_INVALID') {
@@ -356,10 +372,10 @@ app.post('/usgs/:endpoint', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// SENTINEL MAP — Renders colored index PNG, supports AOI polygon clipping
+// ------------------------------------------------------------------------------
+// SENTINEL MAP - Renders colored index PNG, supports AOI polygon clipping
 // Now with dynamic dataset switching (Sentinel-2 / Landsat)
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 app.post('/sentinel/map', async (req, res) => {
   if (!requireJwt(req, res)) return;
 
@@ -370,10 +386,13 @@ app.post('/sentinel/map', async (req, res) => {
   const ds = resolveDataset(datasetType);
   console.log(`[MAP] Index=${indexName}, Dataset=${ds.label}, Type=${ds.hubType}`);
 
+  // Landsat imagery is not on the free CDSE plan
+  if (!ds.shAvailable) return res.status(400).json({ error: LANDSAT_BLOCK_MSG, landsatUnavailable: true });
+
   // UTFVI check
   if (indexName === 'UTFVI') return res.status(400).json({ error: 'UTFVI needs Landsat thermal band (B10). Sentinel-2 has no thermal sensor. Please use NDBaI or NDBI instead.' });
 
-  // RED-EDGE SAFETY CHECK — Landsat cannot do MARINE, REMI, NDRE
+  // RED-EDGE SAFETY CHECK - Landsat cannot do MARINE, REMI, NDRE
   if (RED_EDGE_INDICES.includes(indexName) && !ds.hasRedEdge) {
     return res.status(400).json({
       error: `This index (${indexName}) requires Red-Edge bands, which are only available on Sentinel-2. Please switch to Sentinel-2 satellite data to use ${indexName}.`,
@@ -413,10 +432,10 @@ app.post('/sentinel/map', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// SENTINEL STATISTICS — Returns numeric index values over time
+// ------------------------------------------------------------------------------
+// SENTINEL STATISTICS - Returns numeric index values over time
 // Now with dynamic dataset switching
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 app.post('/sentinel/statistics', async (req, res) => {
   if (!requireJwt(req, res)) return;
 
@@ -425,7 +444,10 @@ app.post('/sentinel/statistics', async (req, res) => {
 
   // Resolve dataset
   const ds = resolveDataset(datasetType);
-  console.log(`[STATS] Index=${indexName}, Dataset=${ds.label}, Range=${startDate}→${endDate}`);
+  console.log(`[STATS] Index=${indexName}, Dataset=${ds.label}, Range=${startDate}->${endDate}`);
+
+  // Landsat imagery is not on the free CDSE plan
+  if (!ds.shAvailable) return res.status(400).json({ error: LANDSAT_BLOCK_MSG, landsatUnavailable: true });
 
   // UTFVI check
   if (indexName==='UTFVI') return res.status(400).json({ error: 'UTFVI needs Landsat thermal band. Sentinel-2 has no thermal sensor. Use NDBaI or NDBI instead.' });
@@ -480,11 +502,11 @@ app.post('/sentinel/statistics', async (req, res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// WMS TILE PROXY — Serves XYZ tiles via Sentinel Hub WMS for high-res map tiles
+// ------------------------------------------------------------------------------
+// WMS TILE PROXY - Serves XYZ tiles via Sentinel Hub WMS for high-res map tiles
 // Uses existing Sentinel Hub credentials (same account, no extra cost)
 // GET /sentinel/tiles/:z/:x/:y?indexName=NDVI&date=2024-06-01&datasetType=sentinel-2
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 app.get('/sentinel/tiles/:z/:x/:y', async (req, res) => {
   // JWT check via query param (tiles are loaded via img src URLs)
   const tokenParam = req.query.token;
@@ -497,6 +519,9 @@ app.get('/sentinel/tiles/:z/:x/:y', async (req, res) => {
 
   const ds = resolveDataset(datasetType);
 
+  // Landsat imagery is not on the free CDSE plan
+  if (!ds.shAvailable) return res.status(400).json({ error: LANDSAT_BLOCK_MSG, landsatUnavailable: true });
+
   // Red-Edge safety
   if (RED_EDGE_INDICES.includes(indexName) && !ds.hasRedEdge) {
     return res.status(400).json({
@@ -508,7 +533,7 @@ app.get('/sentinel/tiles/:z/:x/:y', async (req, res) => {
   const evalscript = getMapEvalscript(indexName, ds);
   if (!evalscript) return res.status(400).json({ error: 'Unknown index: ' + indexName });
 
-  // Convert XYZ tile coords to bbox (Web Mercator → WGS84)
+  // Convert XYZ tile coords to bbox (Web Mercator -> WGS84)
   const n = Math.pow(2, parseInt(z));
   const lon1 = (parseInt(x) / n) * 360 - 180;
   const lon2 = ((parseInt(x) + 1) / n) * 360 - 180;
@@ -547,9 +572,9 @@ app.get('/sentinel/tiles/:z/:x/:y', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// INDEX INFO ENDPOINT — Returns interpretations, warnings, color ramps
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
+// INDEX INFO ENDPOINT - Returns interpretations, warnings, color ramps
+// ------------------------------------------------------------------------------
 app.get('/index-info', (_, res) => {
   res.json({
     redEdgeIndices: RED_EDGE_INDICES,
@@ -557,18 +582,19 @@ app.get('/index-info', (_, res) => {
     warnings: {
       CMRI: 'Warning: CMRI is valid only in coastal/mangrove regions. High inland values represent standard vegetation.',
       MVI: 'MVI is calibrated for mangrove forests. Inland values may not be meaningful.',
-      MARINE: 'MARINE uses Red-Edge bands — Sentinel-2 only.',
-      REMI: 'REMI uses Red-Edge bands — Sentinel-2 only.',
-      NDRE: 'NDRE uses Red-Edge bands — Sentinel-2 only.'
+      MARINE: 'MARINE uses Red-Edge bands - Sentinel-2 only.',
+      REMI: 'REMI uses Red-Edge bands - Sentinel-2 only.',
+      NDRE: 'NDRE uses Red-Edge bands - Sentinel-2 only.'
     }
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ------------------------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`SatelliteApp Proxy v6 on port ${PORT}`);
-  console.log(`Dynamic band mapping: Sentinel-2 + Landsat 8/9`);
+  console.log(`SatelliteApp Proxy v7 on port ${PORT}`);
+  console.log(`Imagery host: Copernicus Data Space Ecosystem (sh.dataspace.copernicus.eu)`);
+  console.log(`Landsat analysis: BLOCKED (not on free CDSE plan); USGS search unaffected`);
   console.log(`Red-Edge indices (Sentinel-2 only): ${RED_EDGE_INDICES.join(', ')}`);
   console.log(`USGS queue: ENABLED`);
-  console.log(`Sentinel Hub configured: ${!!(SENTINEL_ID && SENTINEL_SEC)}`);
+  console.log(`CDSE credentials configured: ${!!(SENTINEL_ID && SENTINEL_SEC)}`);
 });
