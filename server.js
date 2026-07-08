@@ -328,7 +328,7 @@ function evaluatePixel(s){
 // ------------------------------------------------------------------------------
 app.get('/', (_, res) => res.json({
   status:'ok',
-  service:'SatelliteApp Proxy v7 - CDSE (free Copernicus)',
+  service:'SatelliteApp Proxy v7.1 - CDSE + Catalog search',
   queueEnabled:true,
   sentinelHub:!!(SENTINEL_ID&&SENTINEL_SEC),
   supportedDatasets: ['sentinel-2'],
@@ -368,6 +368,56 @@ app.post('/usgs/:endpoint', async (req, res) => {
     res.json(data);
   } catch(e) {
     if (e.name==='AbortError') return res.status(504).json({ error: 'USGS timed out. Please try again in 30 seconds.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ------------------------------------------------------------------------------
+// CDSE CATALOG SEARCH - Sentinel-2 scene search via free Copernicus catalog.
+// Replaces USGS for Sentinel-2 (USGS 'sentinel_2a' dataset needs special access
+// approval -> DATASET_AUTH error). Returns USGS-shaped { data: { results } } so
+// the app can treat both sources identically.
+// ------------------------------------------------------------------------------
+app.post('/catalog/scene-search', async (req, res) => {
+  if (!requireJwt(req, res)) return;
+  const { bbox, startDate, endDate, maxCloudCover, maxResults } = req.body;
+  if (!bbox || !startDate || !endDate) return res.status(400).json({ error: 'bbox, startDate and endDate are required' });
+  try {
+    const token = await getSentinelToken();
+    const r = await fetchTimeout('https://sh.dataspace.copernicus.eu/api/v1/catalog/1.0.0/search', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collections: ['sentinel-2-l2a'],
+        bbox: [bbox.lon1, bbox.lat1, bbox.lon2, bbox.lat2],
+        datetime: `${startDate}T00:00:00Z/${endDate}T23:59:59Z`,
+        limit: 100
+      })
+    }, 45000);
+    let d; try { d = JSON.parse(await r.text()); } catch(e) { return res.status(500).json({ error: 'Catalog non-JSON response' }); }
+    if (!r.ok) return res.status(r.status).json({ error: 'Catalog search failed: ' + JSON.stringify(d).slice(0, 200) });
+
+    const maxCC = (maxCloudCover == null || maxCloudCover >= 100) ? 101 : maxCloudCover;
+    const results = (d.features || [])
+      .filter(f => (f.properties?.['eo:cloud_cover'] ?? 0) <= maxCC)
+      .sort((a, b) => (b.properties?.datetime || '').localeCompare(a.properties?.datetime || ''))
+      .slice(0, maxResults || 20)
+      .map(f => {
+        let geom = f.geometry || null;
+        if (geom && geom.type === 'MultiPolygon') geom = { type: 'Polygon', coordinates: geom.coordinates[0] };
+        const dt = f.properties?.datetime || '';
+        return {
+          entityId: f.id,
+          publishDate: dt.replace('T', ' ').replace('Z', ''),
+          acquisitionDate: dt.split('T')[0],
+          cloudCover: f.properties?.['eo:cloud_cover'] != null ? Math.round(f.properties['eo:cloud_cover']) : null,
+          spatialBounds: geom
+        };
+      });
+    console.log(`[CATALOG] S2 search -> ${results.length} scenes (${startDate}..${endDate}, cc<=${maxCC})`);
+    res.json({ data: { results, totalHits: results.length } });
+  } catch(e) {
+    if (e.name === 'AbortError') return res.status(504).json({ error: 'Catalog search timed out. Please try again.' });
     res.status(500).json({ error: e.message });
   }
 });
